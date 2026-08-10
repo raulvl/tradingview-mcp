@@ -81,17 +81,7 @@ CMD ["streamable-http", "--host", "0.0.0.0", "--port", "8000"]
 CMD ["sh", "-c", "exec tradingview-mcp streamable-http --host 0.0.0.0 --port ${PORT:-8000}"]
 ```
 
-**HEALTHCHECK** — uses the same `$PORT` variable to hit the correct port:
-
-```dockerfile
-# Before:
-CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
-
-# After:
-CMD sh -c 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:${PORT:-8000}/health\")"' || exit 1
-```
-
-The `${PORT:-8000}` syntax means "use `$PORT` if set, otherwise fall back to `8000`" — this keeps local `docker build` / `docker-compose` working.
+**HEALTHCHECK** — removed entirely. FastMCP's `streamable-http` transport only serves `/sse` (GET) and `/mcp` (POST) — there is no built-in `/health` route. Railway handles health checking at the TCP port level, which is sufficient.
 
 ### railway.json Explained
 
@@ -104,7 +94,6 @@ The `${PORT:-8000}` syntax means "use `$PORT` if set, otherwise fall back to `80
   },
   "deploy": {
     "numReplicas": 1,
-    "healthcheckPath": "/health",
     "restartPolicyType": "ON_FAILURE"
   }
 }
@@ -114,7 +103,7 @@ The `${PORT:-8000}` syntax means "use `$PORT` if set, otherwise fall back to `80
 |-------|---------|
 | `builder` | Tells Railway to use the Dockerfile (not Nixpacks) |
 | `numReplicas` | 1 instance (scale up for higher availability) |
-| `healthcheckPath` | Railway pings `/health` every 30s to detect failures |
+| *(no healthcheckPath)* | Railway uses TCP port check (no HTTP endpoint needed) |
 | `restartPolicyType` | `ON_FAILURE` — restarts only on crash, not on idle timeout |
 
 ## Step 3: Install & Authenticate Railway CLI
@@ -178,11 +167,11 @@ Once the build completes, Railway assigns a public URL like:
 https://tradingview-mcp-production.up.railway.app
 ```
 
-Test the health endpoint:
+Test the deployment by hitting the SSE endpoint:
 
 ```bash
-curl https://your-app.up.railway.app/health
-# Expected: {"status": "ok"}  or  HTTP 200
+curl https://your-app.up.railway.app/sse
+# Expected: text/event-stream connection opens (or 200 with SSE headers)
 ```
 
 Check logs in the Railway dashboard under your service → **Deployments** → click the latest deployment → **Build & Deploy Logs**.
@@ -257,11 +246,7 @@ The Docker image is ~200-300MB. At idle, the server uses ~100-150MB RAM.
 Wait and retry. Railway's builder network may be temporarily slow fetching from `astral.sh`.
 
 ### Container starts but healthcheck fails
-This usually means the port binding failed. Check logs:
-```
-railway logs
-```
-Look for `OSError: [Errno 98] Address already in use` or similar.
+FastMCP's `streamable-http` transport has no `/health` endpoint — it only serves `/sse` and `/mcp`. Railway's default TCP port health check works fine. If you added a custom `healthcheckPath`, remove it.
 
 ### "Server not found" in MCP client
 Ensure you're using the `/mcp` path in the URL:
@@ -271,7 +256,7 @@ https://your-app.up.railway.app         ← wrong (no MCP endpoint)
 ```
 
 ### Railway container sleeps / cold starts
-On the free/hobby tier, Railway may scale to zero after inactivity. The first request "wakes" the container (~5-10s cold start). To prevent this, upgrade to a paid plan with minimum 1 replica, or set up a cron job (e.g., UptimeRobot) to ping `/health` every 5 minutes.
+On the free/hobby tier, Railway may scale to zero after inactivity. The first request "wakes" the container (~5-10s cold start). To prevent this, upgrade to a paid plan with minimum 1 replica, or set up a cron job (e.g., UptimeRobot) to ping `https://your-app.up.railway.app/sse` every 5 minutes.
 
 ## Updating Your Deployment
 

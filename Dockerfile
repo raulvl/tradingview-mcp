@@ -33,9 +33,8 @@ USER mcpuser
 # Expose the HTTP port
 EXPOSE 8000
 
-# Health check (uses Railway's PORT env var, falls back to 8000)
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD sh -c 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:${PORT:-8000}/health\")"' || exit 1
+# Railway handles health checking at the TCP port level — FastMCP's
+# streamable-http transport only serves /sse and /mcp (no /health route).
 
 # Run the MCP server over streamable-http (ideal for Docker/remote deployments)
 # Shell-form CMD so Railway's $PORT env var is expanded at runtime
