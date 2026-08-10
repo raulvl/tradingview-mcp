@@ -37,6 +37,5 @@ EXPOSE 8000
 # streamable-http transport only serves /sse and /mcp (no /health route).
 
 # Run the MCP server over streamable-http (ideal for Docker/remote deployments)
-# Shell-form CMD so Railway's $PORT env var is expanded at runtime
-ENTRYPOINT ["tradingview-mcp"]
-CMD ["sh", "-c", "exec tradingview-mcp streamable-http --host 0.0.0.0 --port ${PORT:-8000}"]
+# Shell-form so Railway's $PORT env var is expanded at runtime
+ENTRYPOINT ["/bin/sh", "-c", "exec tradingview-mcp streamable-http --host 0.0.0.0 --port ${PORT:-8000}"]
