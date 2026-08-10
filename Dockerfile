@@ -33,10 +33,11 @@ USER mcpuser
 # Expose the HTTP port
 EXPOSE 8000
 
-# Health check
+# Health check (uses Railway's PORT env var, falls back to 8000)
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD sh -c 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:${PORT:-8000}/health\")"' || exit 1
 
 # Run the MCP server over streamable-http (ideal for Docker/remote deployments)
+# Shell-form CMD so Railway's $PORT env var is expanded at runtime
 ENTRYPOINT ["tradingview-mcp"]
-CMD ["streamable-http", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec tradingview-mcp streamable-http --host 0.0.0.0 --port ${PORT:-8000}"]
