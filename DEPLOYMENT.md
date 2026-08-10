@@ -245,6 +245,16 @@ The Docker image is ~200-300MB. At idle, the server uses ~100-150MB RAM.
 ### Build fails with `curl` or `uv` errors
 Wait and retry. Railway's builder network may be temporarily slow fetching from `astral.sh`.
 
+### `421 Misdirected Request` / "Invalid Host header" in logs
+
+The MCP SDK's DNS-rebinding protection rejects Host headers that aren't in its allowlist. Behind Railway's proxy the public domain never matches, so every request 421s. Fixed in `server.py` by passing:
+
+```python
+transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+```
+
+to the `FastMCP(...)` constructor. If you see this error, make sure your fork contains that change.
+
 ### Container starts but healthcheck fails
 FastMCP's `streamable-http` transport has no `/health` endpoint — it only serves `/sse` and `/mcp`. Railway's default TCP port health check works fine. If you added a custom `healthcheckPath`, remove it.
 
