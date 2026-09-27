@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Recurring `JSONDecodeError: Expecting value` on `coin_analysis` /
+  `multi_timeframe_analysis` / `combined_analysis` / `multi_agent_analysis`**:
+  these tools went through `tradingview_ta.get_multiple_analysis`, which sends
+  `User-Agent: tradingview_ta/3.3.0` and parses the reply without checking the
+  HTTP status — so any rejection from scanner.tradingview.com surfaced as a
+  bare JSON error. The scanner tools (tradingview-screener, browser-like
+  headers) kept working against the same host during the same windows. The TA
+  path now issues its own request (`screener_provider._ta_request`) with
+  tradingview-screener's browser headers and an explicit status check, and
+  raises `UpstreamHTTPError` carrying status, Retry-After and a body snippet.
+- **Diagnosability**: every retry and terminal error now logs the HTTP status,
+  Retry-After and the first 200 bytes of the response instead of assuming an
+  "empty-body outage".
+- **TA retry budget**: separate, longer schedule for the TA path
+  (`TRADINGVIEW_MCP_TA_RETRY_DELAYS`, default `5,20,45`s) that also honours
+  `Retry-After` up to `TRADINGVIEW_MCP_RETRY_AFTER_CAP_S` (default 90s).
+  HTTP 403/408/425/429/5xx are now treated as transient on both paths.
+- **`combined_analysis` confluence logic**: the technical side was
+  `market_sentiment.momentum`, i.e. only "did today's candle close up", so a
+  healthy uptrend with one red day was reported as conflicting with bullish
+  news, and bearish trend + bearish news was reported as HIGH agreement. It now
+  uses `market_structure.trend` (price vs EMA20/50/200) and treats sentiment
+  inside ±0.1 as neutral. `confidence` is HIGH (same direction), MIXED
+  (opposite) or LOW (either side has no clear direction), and new fields
+  `direction`, `technical_direction` and `sentiment_direction` say which way.
+  Callers using HIGH as a buy signal should also require `direction == "BULLISH"`.
+- **`multi_timeframe_analysis`**: the wall-clock budget restarts after each
+  successful timeframe, so a long retry that recovers no longer causes the
+  remaining timeframes to be skipped.
+
 ## [0.8.0] - 2026-07-29
 
 ### Fixed

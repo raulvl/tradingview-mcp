@@ -112,6 +112,30 @@ def _retry_delays() -> tuple:
         return (1.0, 4.0)
 
 
+def _ta_retry_delays() -> tuple:
+    """Retry schedule for the technical-analysis path (coin_analysis,
+    multi_timeframe_analysis, combined_analysis, multi_agent_analysis).
+
+    Added 2026-09-27. The generic ~5s budget above is far shorter than the
+    rejection windows actually observed on this path (5+ minutes on
+    27 Sep 2026), so the TA path gets a longer schedule that can ride out a
+    typical rate-limit window. Override with TRADINGVIEW_MCP_TA_RETRY_DELAYS.
+    """
+    raw = _os.environ.get('TRADINGVIEW_MCP_TA_RETRY_DELAYS', '5.0,20.0,45.0')
+    try:
+        return tuple(float(x) for x in raw.split(',') if x.strip())
+    except Exception:
+        return (5.0, 20.0, 45.0)
+
+
+def _retry_after_cap_s() -> float:
+    """Upper bound on how long we'll honour an upstream Retry-After header."""
+    try:
+        return max(0.0, float(_os.environ.get('TRADINGVIEW_MCP_RETRY_AFTER_CAP_S', '90')))
+    except Exception:
+        return 90.0
+
+
 def _retry_jitter() -> float:
     try:
         return max(0.0, min(1.0, float(_os.environ.get('TRADINGVIEW_MCP_RETRY_JITTER', '0.2'))))
@@ -281,10 +305,146 @@ def _ta_throttle_release() -> None:
     _TA_SEMAPHORE.release()
 
 
+# --- Upstream HTTP diagnostics (added 2026-09-27) --------------------------
+# Root cause of the recurring "JSONDecodeError: Expecting value" outage on the
+# technical-analysis tools: tradingview_ta sends `User-Agent: tradingview_ta/x`
+# and parses the response with json.loads() WITHOUT checking the HTTP status.
+# Any rejection from scanner.tradingview.com (rate limit, block, empty body)
+# therefore surfaced as a bare JSONDecodeError, and we never saw the status
+# code. Meanwhile the scanner tools (tradingview-screener) — same host, but
+# browser-like headers — kept working through the same outage windows.
+#
+# The TA path now issues its own request with the same browser-like headers
+# tradingview-screener uses, checks the status, and raises UpstreamHTTPError
+# carrying the status code, Retry-After, and a body snippet so every failure
+# is logged with what TradingView actually returned.
+
+# Status codes we treat as "try again later" rather than a caller error.
+_TRANSIENT_HTTP_STATUSES = frozenset({403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+_FALLBACK_BROWSER_HEADERS = {
+    'authority': 'scanner.tradingview.com',
+    'accept': 'text/plain, */*; q=0.01',
+    'user-agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36'
+    ),
+    'origin': 'https://www.tradingview.com',
+    'referer': 'https://www.tradingview.com/',
+    'accept-language': 'en-US,en;q=0.9',
+}
+
+
+def _tv_browser_headers() -> Dict[str, str]:
+    """Headers for direct scanner POSTs. Reuse tradingview-screener's header
+    set (the path that stayed healthy during TA outages) when available."""
+    try:
+        from tradingview_screener.query import HEADERS as _SCREENER_HEADERS  # type: ignore
+        return dict(_SCREENER_HEADERS)
+    except Exception:
+        return dict(_FALLBACK_BROWSER_HEADERS)
+
+
+class UpstreamHTTPError(RuntimeError):
+    """A scanner.tradingview.com response we couldn't use, with the details
+    needed to diagnose it (status, Retry-After, first bytes of the body)."""
+
+    def __init__(self, status: int, reason: str, body_snippet: str = "",
+                 retry_after_s: Optional[float] = None):
+        self.status = status
+        self.reason = reason
+        self.body_snippet = body_snippet
+        self.retry_after_s = retry_after_s
+        # 200 + unusable body (empty / non-JSON) is the classic "cliff" shape.
+        self.transient = status in _TRANSIENT_HTTP_STATUSES or status == 200
+        msg = f"HTTP {status} {reason}"
+        if retry_after_s is not None:
+            msg += f", Retry-After={retry_after_s:g}s"
+        msg += f", body[:200]={body_snippet!r}"
+        super().__init__(msg)
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except Exception:
+        return None  # HTTP-date form: ignore, fall back to our own schedule
+
+
+def _ta_request(screener: str, interval: str, symbols: List[str], timeout: float):
+    """Fetch TA for ``symbols`` — equivalent to
+    tradingview_ta.get_multiple_analysis, but with browser-like headers,
+    an explicit status check, and diagnosable errors."""
+    import requests  # type: ignore
+    from tradingview_ta.main import TradingView, calculate  # type: ignore
+
+    indicators_key = TradingView.indicators.copy()
+    data = TradingView.data(symbols, interval, indicators_key)
+    url = f"{TradingView.scan_url}{screener.lower()}/scan"
+
+    resp = requests.post(url, json=data, headers=_tv_browser_headers(), timeout=timeout)
+    status = resp.status_code
+    text = resp.text or ""
+    snippet = text[:200]
+    retry_after = _parse_retry_after(resp.headers.get('Retry-After'))
+
+    if not resp.ok:
+        raise UpstreamHTTPError(status, resp.reason or "error", snippet, retry_after)
+    if not text.strip():
+        raise UpstreamHTTPError(status, "empty body", snippet, retry_after)
+    try:
+        payload = _json.loads(text)
+    except _json.JSONDecodeError:
+        raise UpstreamHTTPError(status, "non-JSON body", snippet, retry_after)
+
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if rows is None:
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if err:
+            # TradingView answered with a structured error (bad column/symbol):
+            # a real caller error, not something retrying will fix.
+            raise ValueError(f"TradingView scanner error: {err}")
+        raise UpstreamHTTPError(status, "JSON without 'data'", snippet, retry_after)
+
+    final: Dict[str, Any] = {}
+    for row in rows:
+        values = row.get("d") or []
+        indicators = {indicators_key[i]: values[i] for i in range(min(len(values), len(indicators_key)))}
+        exch, sym = row["s"].split(":", 1)
+        final[row["s"]] = calculate(
+            indicators=indicators, indicators_key=indicators_key,
+            screener=screener, symbol=sym, exchange=exch, interval=interval,
+        )
+    for s in symbols:
+        if s.upper() not in final:
+            final[s.upper()] = None
+    return final
+
+
+def _describe_exc(e: BaseException) -> str:
+    """One-line description for logs, including HTTP status when known."""
+    if isinstance(e, UpstreamHTTPError):
+        return str(e)
+    resp = getattr(e, 'response', None)
+    status = getattr(resp, 'status_code', None)
+    if status is not None:
+        body = (getattr(resp, 'text', '') or '')[:200]
+        return f"HTTP {status}: {e!r}, body[:200]={body!r}"
+    return repr(e)
+
+
 def _is_transient_screener_error(e: BaseException) -> bool:
     """True if the error looks like an upstream transient (empty body,
     JSON parse failure, connection reset, rate limit, or socket timeout)."""
+    if isinstance(e, UpstreamHTTPError):
+        return e.transient
     if isinstance(e, _json.JSONDecodeError):
+        return True
+    # requests.HTTPError raised by tradingview-screener on non-2xx responses
+    status = getattr(getattr(e, 'response', None), 'status_code', None)
+    if isinstance(status, int) and status in _TRANSIENT_HTTP_STATUSES:
         return True
     # socket.timeout, urllib's ReadTimeoutError, requests.exceptions.Timeout, etc.
     if isinstance(e, (TimeoutError, _socket.timeout)):
@@ -304,12 +464,12 @@ def _is_transient_screener_error(e: BaseException) -> bool:
 
 def _format_transient_error(last_exc: BaseException, attempts: int, total_wait: float) -> str:
     """Build an actionable terminal error message for callers."""
-    base = repr(last_exc)
+    base = _describe_exc(last_exc)
     return (
         f"Upstream TradingView scanner returned transient errors on all "
-        f"{attempts} attempts spanning {total_wait:.0f}s ({base}). "
-        f"This is typically a 30-90s empty-body outage at scanner.tradingview.com. "
-        f"Wait ~60s before retrying."
+        f"{attempts} attempts spanning {total_wait:.0f}s (last response: {base}). "
+        f"scanner.tradingview.com rejected or returned an unusable response; "
+        f"this usually clears within minutes. Wait ~60s before retrying."
     )
 
 
@@ -355,7 +515,7 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
             try:
                 print(
                     f"[tradingview_mcp] transient scanner error (attempt {i+1}/{len(delays)}, "
-                    f"slept {wait:.1f}s): {e!r}",
+                    f"slept {wait:.1f}s): {_describe_exc(e)}",
                     file=_sys.stderr,
                 )
             except Exception:
@@ -389,7 +549,7 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
     transient JSON errors when TradingView's scanner endpoint returns an
     empty body."""
     try:
-        from tradingview_ta import get_multiple_analysis as _gma  # type: ignore
+        import tradingview_ta  # type: ignore  # noqa: F401
     except Exception as e:
         raise ImportError("tradingview_ta is not installed") from e
 
@@ -400,26 +560,25 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
         return cached
 
     _wait_for_failure_cooldown()
-    delays = (0.0,) + _retry_delays()
+    # Longer schedule than the generic scanner path (see _ta_retry_delays).
+    delays = (0.0,) + _ta_retry_delays()
     last_exc: Optional[BaseException] = None
     total_wait = 0.0
+    retry_after: Optional[float] = None
     for i, delay in enumerate(delays):
         wait = _jittered(delay) if delay > 0 else 0.0
+        if retry_after is not None and i > 0:
+            # Honour upstream's Retry-After when it asks for longer than our schedule.
+            wait = max(wait, min(retry_after, _retry_after_cap_s()))
         if wait > 0:
             _time.sleep(wait)
             total_wait += wait
         try:
             _ta_throttle_acquire()
             try:
-                # CRITICAL: tradingview_ta defaults timeout=None, which means
-                # requests.post hangs FOREVER on stalled upstream. socket.setdefaulttimeout
-                # does NOT apply to requests/urllib3. Pass timeout explicitly.
-                result = _gma(
-                    screener=screener,
-                    interval=interval,
-                    symbols=symbols,
-                    timeout=_socket_timeout_s(),
-                )
+                # Explicit timeout: requests has no default and would hang
+                # forever on a stalled upstream.
+                result = _ta_request(screener, interval, symbols, _socket_timeout_s())
             finally:
                 _ta_throttle_release()
             _cache_set(cache_key, result)
@@ -428,10 +587,11 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
             if not _is_transient_screener_error(e):
                 raise
             last_exc = e
+            retry_after = getattr(e, 'retry_after_s', None)
             try:
                 print(
                     f"[tradingview_mcp] transient TA error (attempt {i+1}/{len(delays)}, "
-                    f"slept {wait:.1f}s): {e!r}",
+                    f"slept {wait:.1f}s, symbols={symbols}, interval={interval}): {_describe_exc(e)}",
                     file=_sys.stderr,
                 )
             except Exception:

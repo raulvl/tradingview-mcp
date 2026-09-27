@@ -1083,6 +1083,11 @@ def run_multi_timeframe_analysis(
                 consecutive_failures = 0
                 continue
             consecutive_failures = 0  # Reset on real success.
+            # Upstream is answering again: restart the wall-clock budget so a
+            # long TA retry that eventually succeeded (see
+            # screener_provider._ta_retry_delays) doesn't starve the remaining
+            # timeframes, which complete in ~1s each once upstream is healthy.
+            started_at = _time.time()
 
             data = analysis[symbol]
             indicators = data.indicators

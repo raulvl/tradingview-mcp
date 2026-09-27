@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -622,13 +622,6 @@ async def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: st
         asyncio.to_thread(fetch_news_summary, symbol, cat, 5),
     )
 
-    tech_momentum = tech.get("market_sentiment", {}).get("momentum", "") if isinstance(tech, dict) else ""
-    tech_bullish = tech_momentum == "Bullish"
-    sent_bullish = sentiment.get("sentiment_score", 0) > 0.1
-    signals_agree = tech_bullish == sent_bullish
-    confidence = "HIGH" if signals_agree else "MIXED"
-    tech_signal = tech.get("market_sentiment", {}).get("buy_sell_signal", "N/A") if isinstance(tech, dict) else "N/A"
-
     return {
         "symbol": symbol,
         "exchange": exchange_clean,
@@ -636,16 +629,77 @@ async def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: st
         "technical": tech,
         "sentiment": sentiment,
         "news": {"count": news.get("count", 0), "latest": news.get("items", [])[:3]},
-        "confluence": {
-            "signals_agree": signals_agree,
-            "confidence": confidence,
-            "recommendation": (
-                f"Technical {tech_signal} "
-                f"{'confirmed by' if signals_agree else 'conflicts with'} "
-                f"{sentiment.get('sentiment_label', 'Neutral')} news sentiment "
-                f"({sentiment.get('posts_analyzed', 0)} articles analyzed)"
-            ),
-        },
+        "confluence": _compute_confluence(tech, sentiment),
+    }
+
+
+# Sentiment scores inside this band are treated as "no opinion".
+_SENTIMENT_NEUTRAL_BAND = 0.1
+
+
+def _compute_confluence(tech: Any, sentiment: Any) -> dict:
+    """Do the technical picture and news sentiment point the same way?
+
+    Fixed 2026-09-27. The previous version used
+    ``market_sentiment.momentum`` as the technical side, which is only
+    "did today's candle close up" — so a healthy uptrend with one red day was
+    reported as conflicting with bullish news, and a falling stock with
+    bearish news was reported as HIGH agreement.
+
+    Now:
+      - technical direction = ``market_structure.trend`` (price vs
+        EMA20/50/200: "Bullish" / "Bearish" / "Neutral/Ranging")
+      - sentiment direction = score > +0.1 bullish, < -0.1 bearish, else neutral
+      - confidence: HIGH when both point the same way, MIXED when they point
+        opposite ways, LOW when either side has no clear direction.
+      - ``direction`` says WHICH way they agree (BULLISH / BEARISH / None),
+        so a buy-side gate can require HIGH *and* BULLISH.
+    """
+    tech = tech if isinstance(tech, dict) else {}
+    sentiment = sentiment if isinstance(sentiment, dict) else {}
+
+    trend = (tech.get("market_structure") or {}).get("trend") or ""
+    if trend == "Bullish":
+        tech_dir = "BULLISH"
+    elif trend == "Bearish":
+        tech_dir = "BEARISH"
+    else:
+        tech_dir = "NEUTRAL"
+
+    try:
+        score = float(sentiment.get("sentiment_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score > _SENTIMENT_NEUTRAL_BAND:
+        sent_dir = "BULLISH"
+    elif score < -_SENTIMENT_NEUTRAL_BAND:
+        sent_dir = "BEARISH"
+    else:
+        sent_dir = "NEUTRAL"
+
+    if tech_dir == "NEUTRAL" or sent_dir == "NEUTRAL":
+        confidence, signals_agree, direction = "LOW", False, None
+        verb = "has no clear read against" if tech_dir == "NEUTRAL" else "gets no clear read from"
+    elif tech_dir == sent_dir:
+        confidence, signals_agree, direction = "HIGH", True, tech_dir
+        verb = "confirmed by"
+    else:
+        confidence, signals_agree, direction = "MIXED", False, None
+        verb = "conflicts with"
+
+    tech_signal = (tech.get("market_sentiment") or {}).get("buy_sell_signal", "N/A")
+    label = sentiment.get("sentiment_label", "Neutral")
+    posts = sentiment.get("posts_analyzed", 0)
+    return {
+        "signals_agree": signals_agree,
+        "confidence": confidence,
+        "direction": direction,
+        "technical_direction": tech_dir,
+        "sentiment_direction": sent_dir,
+        "recommendation": (
+            f"{tech_dir.title()} technical trend (BB signal {tech_signal}) {verb} "
+            f"{label} news sentiment ({posts} articles analyzed)"
+        ),
     }
 
 

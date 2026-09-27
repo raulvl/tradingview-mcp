@@ -176,7 +176,10 @@ async def test_combined_analysis_fans_subcalls_in_parallel(monkeypatch):
     """
     def slow_tech(symbol, exchange, timeframe):
         time.sleep(0.1)
-        return {"market_sentiment": {"momentum": "Bullish", "buy_sell_signal": "BUY"}}
+        return {
+            "market_structure": {"trend": "Bullish"},
+            "market_sentiment": {"momentum": "Bullish", "buy_sell_signal": "BUY"},
+        }
 
     def slow_sentiment(symbol, category):
         time.sleep(0.1)
